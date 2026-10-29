@@ -168,7 +168,11 @@ fn banner_lines(app: &App) -> Vec<Line<'static>> {
     match &l.sections {
         Some(Ok(s)) if !s.is_empty() => {
             let honors = s.iter().filter(|s| s.honors).count();
-            let shown = if app.include_honors { s.len() } else { s.len() - honors };
+            let shown = if app.include_honors {
+                s.len()
+            } else {
+                s.len() - honors
+            };
             // Honors sections carry an "HNR-" title, so prefer a regular one.
             let title = s
                 .iter()
@@ -425,9 +429,7 @@ fn section_list(r: &ProfRow) -> String {
             .unwrap_or_default();
     }
     // Long runs collapse so they fit the column: "500 501 502 503 504" -> "500-504".
-    let follows = |a: &str, b: &str| {
-        matches!((a.parse::<u32>(), b.parse::<u32>()), (Ok(a), Ok(b)) if b == a + 1)
-    };
+    let follows = |a: &str, b: &str| matches!((a.parse::<u32>(), b.parse::<u32>()), (Ok(a), Ok(b)) if b == a + 1);
     let mut runs: Vec<Vec<&str>> = Vec::new();
     for s in &r.sections {
         let n = s.section.as_str();
@@ -464,7 +466,10 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     f.render_widget(grade_panel(row, grades.width.saturating_sub(2)), grades);
-    f.render_widget(section_panel(row, sections.height.saturating_sub(2)), sections);
+    f.render_widget(
+        section_panel(row, sections.height.saturating_sub(2)),
+        sections,
+    );
     let state = app.rmp_state(row).cloned();
     let link = draw_rmp(f, state.as_ref(), rmp);
     // popups cover the link, so don't overlay it then
@@ -1204,7 +1209,10 @@ mod tests {
         assert!(screen.contains("Spring 2027 - College Station"));
         assert!(screen.contains("Teresa Leyk"));
         assert!(screen.contains("500-505"), "section runs collapse");
-        assert!(!screen.contains("HNR-"), "title comes from a regular section");
+        assert!(
+            !screen.contains("HNR-"),
+            "title comes from a regular section"
+        );
         assert!(screen.contains("other-campus section"));
         assert!(!screen.contains("Goktas"), "Galveston section leaked in");
         assert!(!screen.contains("Jianer Chen"), "honors section leaked in");
@@ -1217,6 +1225,9 @@ mod tests {
         println!("{screen}");
         assert!(screen.contains("Professors you entered"));
         assert!(screen.contains("Teresa Leyk"));
-        assert!(!screen.contains("AggieSB+"), "--noSB must not show AggieSB+ data");
+        assert!(
+            !screen.contains("AggieSB+"),
+            "--noSB must not show AggieSB+ data"
+        );
     }
 }
