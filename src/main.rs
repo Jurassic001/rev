@@ -1,10 +1,11 @@
 mod anex;
 mod app;
-mod howdy;
 mod model;
 mod names;
 mod net;
 mod rmp;
+mod sb;
+mod schedule;
 mod ui;
 mod worker;
 
@@ -12,7 +13,7 @@ use std::io::{self, Write};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::crossterm::style::{Attribute, Color, Print, SetAttribute, SetForegroundColor};
@@ -26,22 +27,39 @@ rev - who teaches a Texas A&M course, how they grade, and how students rate them
 
 USAGE:
     rev [COURSE] [--term TERM] [--honors]
+    rev [COURSE] --noSB [--prof NAME]...
 
 EXAMPLES:
-    rev CSCE 121
+    rev CSCE 221
     rev \"MATH 151\" --term \"fall 2026\"
-    rev ENGR102 -t 202711 --honors
+    rev CSCE 221 --noSB --prof \"Teresa Leyk\" --prof \"Pearce, Roger\"
 
 OPTIONS:
     -t, --term TERM   term name (\"spring 2027\", \"fall 2026 galveston\") or Banner code;
                       defaults to the upcoming College Station term
     --honors          include honors sections (hidden by default; toggle with h)
-    -h, --help        show this message";
+    --noSB            don't use the AggieSB+ API for the roster; type in the professors
+                      you see in Schedule Builder instead (press p in the app)
+    -p, --prof NAME   with --noSB: a professor teaching the course; repeat it, or
+                      separate names with ';'
+    -h, --help        show this message
+
+Sections on campuses other than the term's are always hidden.";
 
 fn main() -> anyhow::Result<()> {
     let mut course = Vec::new();
     let mut term = None;
     let mut honors = false;
+    let mut no_sb = false;
+    let mut profs: Vec<String> = Vec::new();
+    let mut add_profs = |list: &str| {
+        profs.extend(
+            list.split(';')
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+                .map(String::from),
+        )
+    };
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -51,14 +69,28 @@ fn main() -> anyhow::Result<()> {
             }
             "-t" | "--term" => term = Some(args.next().context("--term needs a value")?),
             "--honors" => honors = true,
+            _ if arg.eq_ignore_ascii_case("--nosb") || arg.eq_ignore_ascii_case("--no-sb") => {
+                no_sb = true
+            }
+            "-p" | "--prof" => add_profs(&args.next().context("--prof needs a name")?),
             _ if arg.starts_with("--term=") => term = Some(arg["--term=".len()..].to_string()),
+            _ if arg.starts_with("--prof=") => add_profs(&arg["--prof=".len()..]),
+            _ if arg.starts_with('-') => bail!("unknown option {arg}; see --help"),
             _ => course.push(arg),
         }
     }
     let course = (!course.is_empty()).then(|| course.join(" "));
+    if !profs.is_empty() && !no_sb {
+        bail!("--prof only applies with --noSB (otherwise the roster comes from AggieSB+)");
+    }
+    if let Some(bad) = profs.iter().find(|p| names::Person::from_full(p).is_none()) {
+        bail!(
+            "--prof \"{bad}\": give a first and last name, e.g. \"Teresa Leyk\" or \"Leyk, Teresa\""
+        );
+    }
 
     let (jobs, msgs) = worker::spawn();
-    let mut app = App::new(jobs, course, term, honors);
+    let mut app = App::new(jobs, course, term, honors, no_sb.then_some(profs));
 
     // ratatui's panic hook restores the screen; this one also releases the mouse.
     let hook = std::panic::take_hook();

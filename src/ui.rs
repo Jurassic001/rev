@@ -11,8 +11,9 @@ use ratatui::widgets::{
 
 use crate::anex::Grades;
 use crate::app::{App, Link, Mode};
-use crate::model::{self, ProfRow, RmpState};
+use crate::model::{self, ProfRow, RmpState, Roster};
 use crate::names::Strength;
+use crate::schedule::Section;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 pub const LINK_STYLE: Style = Style::new()
@@ -85,6 +86,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
 
     match app.mode {
         Mode::PickTerm => draw_picker(f, app),
+        Mode::EditProfs => draw_prof_editor(f, app),
         Mode::Help => draw_help(f),
         _ => {}
     }
@@ -109,31 +111,40 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
             .unwrap_or_else(|| "—".into());
         Span::styled(c, Style::new().bold())
     };
-    let term = app
-        .term
-        .as_ref()
-        .map_or("loading…".to_string(), |t| t.desc.clone());
     let honors = if app.include_honors {
         Span::styled("shown", Style::new().fg(Color::Magenta))
     } else {
         dim("hidden")
     };
-    let line = Line::from(vec![
-        dim(" Course "),
-        course,
-        dim("   Term "),
-        Span::styled(term, Style::new().bold()),
-        dim(if app.terms_live || app.terms.is_empty() {
-            ""
-        } else {
-            " (offline list)"
-        }),
+    let mut spans = vec![dim(" Course "), course];
+    match &app.profs {
+        Some(names) => spans.extend([
+            dim("   Roster "),
+            Span::styled(format!("typed in ({})", names.len()), Style::new().bold()),
+        ]),
+        None => {
+            let term = app
+                .term
+                .as_ref()
+                .map_or("loading…".to_string(), |t| t.desc.clone());
+            spans.extend([
+                dim("   Term "),
+                Span::styled(term, Style::new().bold()),
+                dim(if app.terms_live || app.terms.is_empty() {
+                    ""
+                } else {
+                    " (offline list)"
+                }),
+            ]);
+        }
+    }
+    spans.extend([
         dim("   Honors "),
         honors,
         dim("   Sort "),
         Span::raw(app.sort.label()),
     ]);
-    f.render_widget(Paragraph::new(line), inner);
+    f.render_widget(Paragraph::new(Line::from(spans)), inner);
     if editing {
         let x = inner.x + " Course ".len() as u16 + app.cursor as u16;
         f.set_cursor_position((x.min(inner.right().saturating_sub(1)), inner.y));
@@ -147,27 +158,46 @@ fn banner_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let warn = Style::new().fg(Color::Yellow);
     let course = format!("{} {}", l.subject, l.number);
+    let term = l.term().map_or(String::new(), |t| t.desc.clone());
+    let elsewhere = match l.other_campus {
+        0 => String::new(),
+        1 => " · 1 other-campus section hidden".to_string(),
+        n => format!(" · {n} other-campus sections hidden"),
+    };
 
     match &l.sections {
         Some(Ok(s)) if !s.is_empty() => {
             let honors = s.iter().filter(|s| s.honors).count();
+            let shown = if app.include_honors { s.len() } else { s.len() - honors };
+            // Honors sections carry an "HNR-" title, so prefer a regular one.
             let title = s
                 .iter()
+                .filter(|s| !s.honors)
+                .chain(s)
                 .map(|s| s.title.as_str())
                 .find(|t| !t.is_empty())
                 .unwrap_or("");
             let mut spans = vec![
                 Span::styled(format!(" {course} "), Style::new().bold()),
-                Span::raw(format!("{title} · {} sections", s.len())),
+                Span::raw(format!(
+                    "{title} · {shown} section{}",
+                    if shown == 1 { "" } else { "s" }
+                )),
             ];
             if honors > 0 && !app.include_honors {
                 spans.push(dim(format!(" ({honors} honors hidden, h to show)")));
             }
+            spans.push(dim(elsewhere));
             lines.push(Line::from(spans));
         }
         Some(Ok(_)) => {
+            let only_elsewhere = if l.other_campus > 0 {
+                " (only on other campuses)"
+            } else {
+                ""
+            };
             lines.push(Line::styled(
-                format!(" ⚠ Howdy lists no {course} sections for {}.", l.term.desc),
+                format!(" ⚠ AggieSB+ lists no {course} sections for {term}{only_elsewhere}."),
                 warn,
             ));
             lines.push(Line::styled(
@@ -179,12 +209,15 @@ fn banner_lines(app: &App) -> Vec<Line<'static>> {
             lines.push(Line::styled(format!(" ⚠ {e}."), warn));
             lines.push(Line::styled(
                 format!(
-                    "   Showing recent instructors from anex instead; this is NOT the {} roster.",
-                    l.term.desc
+                    "   Showing recent instructors from anex, NOT the {term} roster. Try --noSB to type it in."
                 ),
                 warn,
             ));
         }
+        None if l.loaded => lines.push(Line::from(vec![
+            Span::styled(format!(" {course} "), Style::new().bold()),
+            dim("· professors typed in from Schedule Builder (p to edit)"),
+        ])),
         None => {}
     }
     match &l.anex {
@@ -340,10 +373,13 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
         Constraint::Length(5),
         Constraint::Length(5),
     ];
-    let title = if app.lookup.as_ref().is_some_and(|l| l.sections().is_empty()) {
-        " Recent instructors (anex history) "
-    } else {
-        " Professors this term "
+    let title = match &app.lookup {
+        Some(l) if l.loaded => match l.roster() {
+            Roster::Sections(_) => " Professors this term (AggieSB+) ",
+            Roster::Names(_) => " Professors you entered ",
+            Roster::AnexRecent => " Recent instructors (anex history) ",
+        },
+        _ => " Professors ",
     };
     let block = Block::bordered().title(title);
     let inner = block.inner(area);
@@ -359,7 +395,10 @@ fn draw_table(f: &mut Frame, app: &mut App, area: Rect) {
                 "Type a course (e.g. CSCE 121) and press Enter."
             }
             None => "Press / to enter a course.",
-            Some(l) if l.sections.is_none() => "Loading…",
+            Some(l) if l.source.manual_names().is_some_and(|n| n.is_empty()) => {
+                "Press p and type in the professors you see in Schedule Builder."
+            }
+            Some(l) if !l.loaded => "Loading…",
             Some(l) if !l.sections().is_empty() => {
                 "Every section this term is honors. Press h to include honors sections."
             }
@@ -385,9 +424,23 @@ fn section_list(r: &ProfRow) -> String {
             .map(|t| format!("last {}", t.label))
             .unwrap_or_default();
     }
-    r.sections
-        .iter()
-        .map(|s| s.section.as_str())
+    // Long runs collapse so they fit the column: "500 501 502 503 504" -> "500-504".
+    let follows = |a: &str, b: &str| {
+        matches!((a.parse::<u32>(), b.parse::<u32>()), (Ok(a), Ok(b)) if b == a + 1)
+    };
+    let mut runs: Vec<Vec<&str>> = Vec::new();
+    for s in &r.sections {
+        let n = s.section.as_str();
+        match runs.last_mut() {
+            Some(run) if follows(run[run.len() - 1], n) => run.push(n),
+            _ => runs.push(vec![n]),
+        }
+    }
+    runs.iter()
+        .map(|run| match run.as_slice() {
+            [first, .., last] if run.len() > 2 => format!("{first}-{last}"),
+            _ => run.join(" "),
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -411,10 +464,11 @@ fn draw_detail(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     };
     f.render_widget(grade_panel(row, grades.width.saturating_sub(2)), grades);
-    f.render_widget(section_panel(row), sections);
+    f.render_widget(section_panel(row, sections.height.saturating_sub(2)), sections);
     let state = app.rmp_state(row).cloned();
     let link = draw_rmp(f, state.as_ref(), rmp);
-    if app.mode != Mode::PickTerm && app.mode != Mode::Help {
+    // popups cover the link, so don't overlay it then
+    if app.mode == Mode::Normal || app.mode == Mode::EditCourse {
         app.link = link;
     }
 }
@@ -436,9 +490,10 @@ fn grade_panel(row: &ProfRow, width: u16) -> Paragraph<'static> {
         Span::raw(" GPA "),
         Span::styled(format!("{gpa:.2}"), Style::new().fg(gpa_color(gpa)).bold()),
         dim(format!(
-            "  {} students, {} terms",
+            "  {} students, {} term{}",
             thousands(g.students()),
-            row.history.len()
+            row.history.len(),
+            if row.history.len() == 1 { "" } else { "s" }
         )),
     ])];
     let colors = [
@@ -478,7 +533,7 @@ fn grade_panel(row: &ProfRow, width: u16) -> Paragraph<'static> {
     Paragraph::new(lines).block(block)
 }
 
-fn section_panel(row: &ProfRow) -> Paragraph<'static> {
+fn section_panel(row: &ProfRow, height: u16) -> Paragraph<'static> {
     if row.sections.is_empty() {
         let block = Block::bordered().title(" Terms taught (anex) ");
         let lines: Vec<Line> = row
@@ -497,38 +552,46 @@ fn section_panel(row: &ProfRow) -> Paragraph<'static> {
             .collect();
         return Paragraph::new(lines).block(block);
     }
-    let block = Block::bordered().title(" Sections this term (Howdy) ");
+    let block = Block::bordered().title(" Sections this term (AggieSB+) ");
     let mut lines: Vec<Line> = vec![dim(" Sec  CRN    Meets").into()];
-    lines.extend(row.sections.iter().map(|s| {
-        let mut spans = vec![
-            Span::styled(format!(" {:<4}", s.section), Style::new().bold()),
-            dim(format!(" {:<6}", s.crn)),
-            Span::raw(format!(
-                " {}",
-                if s.meetings.is_empty() {
-                    "TBA".to_string()
-                } else {
-                    s.meetings.clone()
-                }
-            )),
-        ];
-        // Lectures are the norm; only call out labs, online sections, etc.
-        if !s.schedule.is_empty() && !s.schedule.eq_ignore_ascii_case("lecture") {
-            spans.push(dim(format!("  {}", s.schedule)));
+    for (i, s) in row.sections.iter().enumerate() {
+        let group = section_lines(s);
+        let left = row.sections.len() - i;
+        // Keep a line free to say how many didn't fit.
+        let reserve = usize::from(left > 1);
+        if lines.len() + group.len() + reserve > usize::from(height) {
+            let plural = if left == 1 { "" } else { "s" };
+            lines.push(dim(format!(" … {left} more section{plural}")).into());
+            break;
         }
-        if s.honors {
-            spans.push(Span::styled("  honors", Style::new().fg(Color::Magenta)));
-        }
-        match s.open {
-            Some(true) => spans.push(Span::styled("  open", Style::new().fg(Color::Green))),
-            Some(false) => spans.push(Span::styled("  full", Style::new().fg(Color::Red))),
-            None => {}
-        }
-        Line::from(spans)
-    }));
-    Paragraph::new(lines)
-        .wrap(Wrap { trim: false })
-        .block(block)
+        lines.extend(group);
+    }
+    Paragraph::new(lines).block(block)
+}
+
+/// One line per meeting, so a lecture plus lab never wraps in a narrow pane.
+fn section_lines(s: &Section) -> Vec<Line<'static>> {
+    let mut meetings = s.meetings.split("; ").filter(|m| !m.is_empty());
+    let mut spans = vec![
+        Span::styled(format!(" {:<4}", s.section), Style::new().bold()),
+        dim(format!(" {:<6}", s.crn)),
+        Span::raw(format!(" {}", meetings.next().unwrap_or("TBA"))),
+    ];
+    if !s.delivery.is_empty() {
+        spans.push(dim(format!("  {}", s.delivery)));
+    }
+    if s.honors {
+        spans.push(Span::styled("  honors", Style::new().fg(Color::Magenta)));
+    }
+    match s.open {
+        Some(true) => spans.push(Span::styled("  open", Style::new().fg(Color::Green))),
+        Some(false) => spans.push(Span::styled("  full", Style::new().fg(Color::Red))),
+        None => {}
+    }
+    let mut lines = vec![Line::from(spans)];
+    // indented to line up under the first meeting
+    lines.extend(meetings.map(|m| Line::raw(format!("{:13}{m}", ""))));
+    lines
 }
 
 fn draw_rmp(f: &mut Frame, state: Option<&RmpState>, area: Rect) -> Option<Link> {
@@ -628,7 +691,28 @@ fn draw_rmp(f: &mut Frame, state: Option<&RmpState>, area: Rect) -> Option<Link>
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let keys: &[(&str, &str)] = match app.mode {
+        Mode::EditCourse if app.manual() => &[
+            ("Enter", "search"),
+            ("Tab", "professors"),
+            ("Esc", "cancel"),
+        ],
         Mode::EditCourse => &[("Enter", "search"), ("Tab", "term"), ("Esc", "cancel")],
+        Mode::EditProfs => &[
+            ("Enter", "add"),
+            ("↑↓", "select"),
+            ("Del", "remove"),
+            ("Esc", "done"),
+        ],
+        _ if app.manual() => &[
+            ("/", "course"),
+            ("p", "professors"),
+            ("h", "honors"),
+            ("s", "sort"),
+            ("o", "open RMP"),
+            ("r", "refresh"),
+            ("?", "help"),
+            ("q", "quit"),
+        ],
         Mode::PickTerm => &[
             ("type", "filter"),
             ("↑↓", "move"),
@@ -655,11 +739,6 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         spans.push(dim(format!(" {v} ")));
     }
     let keys = Line::from(spans);
-    let [left, right] =
-        Layout::horizontal([Constraint::Length(keys.width() as u16), Constraint::Fill(1)])
-            .areas(area);
-    f.render_widget(Paragraph::new(keys), left);
-
     let status = match &app.notice {
         Some(n) => Span::styled(format!("{n} "), Style::new().fg(Color::Yellow)),
         None if app.busy() => Span::raw(format!(
@@ -669,7 +748,17 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         )),
         None => dim(format!("{} ", app.status)),
     };
-    f.render_widget(Paragraph::new(Line::from(status).right_aligned()), right);
+    let status = Line::from(status).right_aligned();
+    // A notice matters more than the key list, which is always the same.
+    if app.notice.is_some() && keys.width() + status.width() > usize::from(area.width) {
+        f.render_widget(Paragraph::new(status), area);
+        return;
+    }
+    let [left, right] =
+        Layout::horizontal([Constraint::Length(keys.width() as u16), Constraint::Fill(1)])
+            .areas(area);
+    f.render_widget(Paragraph::new(keys), left);
+    f.render_widget(Paragraph::new(status), right);
 }
 
 fn popup(f: &mut Frame, width: u16, height: u16, title: &str) -> Rect {
@@ -722,8 +811,57 @@ fn draw_picker(f: &mut Frame, app: &App) {
     f.render_stateful_widget(list_widget, list, &mut state);
 }
 
+fn draw_prof_editor(f: &mut Frame, app: &App) {
+    let inner = popup(f, 64, 22, " Professors from Schedule Builder ");
+    let names = app.profs.as_deref().unwrap_or_default();
+    let [hint, list, input, keys] = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+        Constraint::Length(2),
+    ])
+    .areas(inner);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::raw(" Type each professor listed for this course, then Enter."),
+            dim(" \"Teresa Leyk\" or \"Leyk, Teresa\"; separate several with ;").into(),
+        ]),
+        hint,
+    );
+    if names.is_empty() {
+        f.render_widget(Paragraph::new(dim("  (none yet)")), list);
+    } else {
+        let items: Vec<ListItem> = names
+            .iter()
+            .map(|n| ListItem::new(format!(" {}", crate::names::natural_order(n))))
+            .collect();
+        let mut state = ListState::default().with_selected(Some(app.prof_sel));
+        let widget = List::new(items)
+            .highlight_style(Style::new().bg(Color::Rgb(40, 50, 70)).bold())
+            .highlight_symbol("▶");
+        f.render_stateful_widget(widget, list, &mut state);
+    }
+    let prompt = " Add: ";
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(prompt, Style::new().fg(Color::Cyan).bold()),
+            Span::raw(app.prof_input.clone()),
+        ])),
+        input,
+    );
+    let x = input.x + (prompt.len() + app.prof_input.chars().count()) as u16;
+    f.set_cursor_position((x.min(input.right().saturating_sub(1)), input.y));
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::raw(""),
+            dim(" Enter on a blank line or Esc when done · Del removes one").into(),
+        ]),
+        keys,
+    );
+}
+
 fn draw_help(f: &mut Frame) {
-    let inner = popup(f, 72, 26, " Help ");
+    let inner = popup(f, 76, 28, " Help ");
     let key = |k: &str, v: &str| {
         Line::from(vec![
             Span::styled(format!(" {k:<14}"), Style::new().fg(Color::Cyan).bold()),
@@ -733,6 +871,10 @@ fn draw_help(f: &mut Frame) {
     let lines = vec![
         key("/  c  e", "enter a course (e.g. CSCE 121)"),
         key("t", "choose the term (fall, spring, summer; any campus)"),
+        key(
+            "p",
+            "with --noSB: type in the professors from Schedule Builder",
+        ),
         key("h", "show / hide honors sections (hidden by default)"),
         key("s", "cycle sort: GPA, quality, difficulty, # ratings, name"),
         key("o  Enter", "open the selected professor's RMP page"),
@@ -742,14 +884,15 @@ fn draw_help(f: &mut Frame) {
         key("q  Ctrl-C", "quit"),
         Line::raw(""),
         dim(" Sources").into(),
-        Line::raw("  Howdy public class search: who teaches each section this term"),
+        Line::raw("  AggieSB+ API: who teaches each section this term (skip with --noSB)"),
         Line::raw("  anex.us: past grade distributions for this course, per professor"),
         Line::raw("  Rate My Professors: quality, difficulty, would-take-again"),
         Line::raw(""),
         dim(" GPA and percentages cover every term anex has for that professor").into(),
         dim(" in this course. Q% is the share of students who Q-dropped.").into(),
         dim(" ~ before a quality score means the RMP match used only a first").into(),
-        dim(" initial. Results are cached for a few hours; press r to refetch.").into(),
+        dim(" initial. Sections on other campuses are always hidden. Results").into(),
+        dim(" are cached for a few hours; press r to refetch.").into(),
         Line::raw(""),
         dim(" Press any key to close.").into(),
     ];
@@ -762,24 +905,28 @@ mod tests {
 
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     use crate::anex::{Grades, Record};
-    use crate::app::App;
-    use crate::howdy::{Instructor, Section, Term};
+    use crate::app::{App, Mode};
     use crate::names::Strength;
     use crate::rmp::{Found, Teacher};
-    use crate::worker::Msg;
+    use crate::schedule::{Instructor, Section, Term};
+    use crate::worker::{Job, Msg, Source};
 
     fn section(num: &str, who: &str) -> Section {
         Section {
-            subject: "CSCE".into(),
-            course: "121".into(),
             section: num.into(),
             crn: format!("4{num}1"),
-            title: "INTRO PGM DESIGN CONCEPT".into(),
+            title: "DATA STRUC & ALGORITHMS".into(),
             subject_desc: "Computer Science & Engineering".into(),
-            schedule: "Lecture".into(),
-            meetings: "MWF 09:10-10:00".into(),
+            campus: "College Station".into(),
+            delivery: if num == "700" {
+                "online".into()
+            } else {
+                String::new()
+            },
+            meetings: "MWF 8:00-8:50a; TR 2:20-3:10p lab".into(),
             open: Some(num != "502"),
             honors: crate::anex::is_honors_section(num),
             instructors: (!who.is_empty())
@@ -803,6 +950,22 @@ mod tests {
         }
     }
 
+    fn leyk() -> Found {
+        Found {
+            teacher: Teacher {
+                legacy_id: 1234567,
+                first: "Teresa".into(),
+                last: "Leyk".into(),
+                department: "Computer Science".into(),
+                quality: 3.4,
+                difficulty: 3.6,
+                num_ratings: 88,
+                would_take_again: Some(55.0),
+            },
+            strength: Strength::Exact,
+        }
+    }
+
     fn render(app: &mut App) -> String {
         let mut term = Terminal::new(TestBackend::new(120, 34)).unwrap();
         term.draw(|f| super::draw(f, app)).unwrap();
@@ -817,91 +980,243 @@ mod tests {
             .join("\n")
     }
 
+    fn key(app: &mut App, code: KeyCode) {
+        app.on_key(KeyEvent::from(code));
+    }
+
+    fn type_text(app: &mut App, text: &str) {
+        for c in text.chars() {
+            key(app, KeyCode::Char(c));
+        }
+    }
+
     #[test]
-    fn renders_lookup() {
-        let (tx, _rx) = channel();
-        let mut app = App::new(tx, Some("CSCE 121".into()), None, false);
+    fn renders_aggie_sb_lookup() {
+        let (tx, rx) = channel();
+        let mut app = App::new(tx, Some("CSCE 221".into()), None, false, None);
+        assert!(matches!(rx.try_recv(), Ok(Job::Terms)));
         app.on_msg(Msg::Terms(Ok(vec![Term {
-            code: crate::howdy::likely_term_code(),
+            code: crate::schedule::likely_term_code(),
             desc: "Spring 2027 - College Station".into(),
         }])));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Job::Lookup {
+                source: Source::Sb(_),
+                ..
+            })
+        ));
         let sections = vec![
-            section("501", "Shawn Lupoli"),
-            section("502", "Shawn Lupoli"),
-            section("503", "Qin Huang"),
-            section("200", "Honors Person"),
-            section("504", ""),
+            section("500", "Teresa Leyk"),
+            section("501", "Teresa Leyk"),
+            section("506", "Roger A. Pearce"),
+            section("700", "Roger A. Pearce"),
+            section("200", "Jianer Chen"),
+            section("512", ""),
         ];
         let anex = vec![
-            record("LUPOLI S", "501", 2024, "SPRING", [40, 30, 15, 5, 5, 5]),
-            record("HUANG Q", "502", 2023, "FALL", [60, 20, 10, 3, 2, 5]),
+            record("LEYK T", "501", 2024, "SPRING", [40, 30, 15, 5, 5, 5]),
+            record("PEARCE R", "502", 2023, "FALL", [60, 20, 10, 3, 2, 5]),
         ];
         app.on_msg(Msg::Course {
             generation: 1,
-            sections: Ok(sections),
+            sections: Some(Ok(sections)),
+            other_campus: 1,
             anex: Ok(anex),
         });
-        let teacher = Teacher {
-            legacy_id: 2300100,
-            first: "Shawn".into(),
-            last: "Lupoli".into(),
-            department: "Computer Science".into(),
-            quality: 2.6,
-            difficulty: 2.7,
-            num_ratings: 103,
-            would_take_again: Some(48.0),
-        };
         app.on_msg(Msg::Rmp {
             generation: 1,
-            key: "SHAWN LUPOLI".into(),
-            result: Ok(Some(Found {
-                teacher,
-                strength: Strength::Exact,
-            })),
+            key: "TERESA LEYK".into(),
+            result: Ok(Some(leyk())),
         });
         app.on_msg(Msg::Rmp {
             generation: 1,
-            key: "QIN HUANG".into(),
+            key: "ROGER A PEARCE".into(),
             result: Ok(None),
         });
-        // GPA sort puts Huang first; select Lupoli to show his RMP pane
-        app.on_key(ratatui::crossterm::event::KeyEvent::from(
-            ratatui::crossterm::event::KeyCode::Down,
-        ));
+        // GPA sort puts Pearce first; select Leyk to show her RMP pane
+        key(&mut app, KeyCode::Down);
         let screen = render(&mut app);
         println!("{screen}");
-        assert!(screen.contains("Shawn Lupoli"));
-        assert!(screen.contains("ratemyprofessors.com/professor/2300100"));
+        assert!(screen.contains("Professors this term (AggieSB+)"));
         assert!(screen.contains("1 honors hidden"));
-        assert!(!screen.contains("Honors Person"));
+        assert!(screen.contains("1 other-campus section hidden"));
+        assert!(!screen.contains("Jianer Chen"));
         assert!(screen.contains("TBA (not assigned)"));
-        let link = app.link.as_ref().expect("link recorded");
+        assert!(screen.contains("ratemyprofessors.com/professor/1234567"));
         assert_eq!(
-            link.url,
-            "https://www.ratemyprofessors.com/professor/2300100"
+            app.link.as_ref().expect("link recorded").url,
+            "https://www.ratemyprofessors.com/professor/1234567"
         );
     }
 
     #[test]
-    fn renders_fallback_and_picker() {
+    fn renders_aggie_sb_failure() {
         let (tx, _rx) = channel();
-        let mut app = App::new(tx, Some("CSCE 121".into()), Some("fall 2026".into()), false);
-        app.on_msg(Msg::Terms(Err("Howdy answered with a Cloudflare browser challenge instead of data (HTTP 403 Forbidden)".into())));
+        let mut app = App::new(
+            tx,
+            Some("CSCE 221".into()),
+            Some("fall 2026".into()),
+            false,
+            None,
+        );
+        let err = "AggieSB+ returned HTTP 503";
+        app.on_msg(Msg::Terms(Err(err.into())));
         app.on_msg(Msg::Course {
             generation: 1,
-            sections: Err("Howdy answered with a Cloudflare browser challenge instead of data (HTTP 403 Forbidden)".into()),
-            anex: Ok(vec![record("MOORE J", "501", 2024, "SPRING", [10, 10, 10, 1, 1, 2])]),
+            sections: Some(Err(err.into())),
+            other_campus: 0,
+            anex: Ok(vec![record(
+                "LEYK T",
+                "501",
+                2024,
+                "SPRING",
+                [10, 10, 10, 1, 1, 2],
+            )]),
         });
-        println!("{}", render(&mut app));
-        app.on_key(ratatui::crossterm::event::KeyEvent::from(
-            ratatui::crossterm::event::KeyCode::Char('t'),
-        ));
         let screen = render(&mut app);
         println!("{screen}");
+        assert!(screen.contains("Recent instructors (anex history)"));
+        assert!(screen.contains("Try --noSB"));
+        key(&mut app, KeyCode::Char('t'));
+        let screen = render(&mut app);
         assert!(screen.contains("Fall 2026 - College Station"));
         assert!(
             app.link.is_none(),
             "no link overlay while a popup covers the screen"
         );
+    }
+
+    #[test]
+    fn manual_roster() {
+        let (tx, rx) = channel();
+        let mut app = App::new(tx, Some("CSCE 221".into()), None, false, Some(Vec::new()));
+        // no AggieSB+ traffic at all: the first job is the anex/RMP lookup
+        let Ok(Job::Lookup {
+            source: Source::Manual(names),
+            ..
+        }) = rx.try_recv()
+        else {
+            panic!("expected a manual lookup");
+        };
+        assert!(names.is_empty());
+        assert!(app.mode == Mode::EditProfs, "empty roster opens the editor");
+
+        type_text(&mut app, "Leyk, Teresa; Roger A. Pearce");
+        key(&mut app, KeyCode::Enter);
+        type_text(&mut app, "Merchant");
+        key(&mut app, KeyCode::Enter);
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("first and last name")
+        );
+        assert_eq!(app.prof_input, "Merchant", "rejected entry stays editable");
+        for _ in 0.."Merchant".len() {
+            key(&mut app, KeyCode::Backspace);
+        }
+        type_text(&mut app, "Amit Merchant");
+        key(&mut app, KeyCode::Enter);
+        println!("{}", render(&mut app));
+        key(&mut app, KeyCode::Esc);
+        assert!(app.mode == Mode::Normal);
+
+        let Ok(Job::Lookup {
+            source: Source::Manual(names),
+            ..
+        }) = rx.try_recv()
+        else {
+            panic!("closing the editor should redo the lookup");
+        };
+        assert_eq!(names, ["Leyk, Teresa", "Roger A. Pearce", "Amit Merchant"]);
+        app.on_msg(Msg::Course {
+            generation: 2,
+            sections: None,
+            other_campus: 0,
+            anex: Ok(vec![record(
+                "LEYK T",
+                "501",
+                2024,
+                "SPRING",
+                [40, 30, 15, 5, 5, 5],
+            )]),
+        });
+        app.on_msg(Msg::Rmp {
+            generation: 2,
+            key: "TERESA LEYK".into(),
+            result: Ok(Some(leyk())),
+        });
+        let screen = render(&mut app);
+        println!("{screen}");
+        assert!(screen.contains("Professors you entered"));
+        assert!(screen.contains("Roster typed in (3)"));
+        assert!(screen.contains("Teresa Leyk"));
+        assert!(screen.contains("Amit Merchant"));
+        assert!(
+            !screen.contains("Term "),
+            "no term shown for a typed-in roster"
+        );
+
+        // reopening and deleting a name triggers another lookup
+        key(&mut app, KeyCode::Char('p'));
+        key(&mut app, KeyCode::Delete);
+        key(&mut app, KeyCode::Enter);
+        let Ok(Job::Lookup {
+            source: Source::Manual(names),
+            ..
+        }) = rx.try_recv()
+        else {
+            panic!("expected a lookup after removing a name");
+        };
+        assert_eq!(names.len(), 2);
+    }
+
+    /// Feeds the real worker's messages to the app until the lookup finishes.
+    fn run_live(profs: Option<Vec<String>>) -> String {
+        let (jobs, msgs) = crate::worker::spawn();
+        let mut app = App::new(
+            jobs,
+            Some("CSCE 221".into()),
+            Some("spring 2027".into()),
+            false,
+            profs,
+        );
+        loop {
+            let msg = msgs
+                .recv_timeout(std::time::Duration::from_secs(120))
+                .expect("worker went quiet");
+            let done = matches!(msg, Msg::Done { .. });
+            app.on_msg(msg);
+            if done {
+                break;
+            }
+        }
+        render(&mut app)
+    }
+
+    /// The whole pipeline against the real sites: `cargo test -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_aggie_sb() {
+        let screen = run_live(None);
+        println!("{screen}");
+        assert!(screen.contains("Spring 2027 - College Station"));
+        assert!(screen.contains("Teresa Leyk"));
+        assert!(screen.contains("500-505"), "section runs collapse");
+        assert!(!screen.contains("HNR-"), "title comes from a regular section");
+        assert!(screen.contains("other-campus section"));
+        assert!(!screen.contains("Goktas"), "Galveston section leaked in");
+        assert!(!screen.contains("Jianer Chen"), "honors section leaked in");
+    }
+
+    #[test]
+    #[ignore]
+    fn live_manual() {
+        let screen = run_live(Some(vec!["Leyk, Teresa".into(), "Roger Pearce".into()]));
+        println!("{screen}");
+        assert!(screen.contains("Professors you entered"));
+        assert!(screen.contains("Teresa Leyk"));
+        assert!(!screen.contains("AggieSB+"), "--noSB must not show AggieSB+ data");
     }
 }

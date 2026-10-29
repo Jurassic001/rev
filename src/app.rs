@@ -10,30 +10,47 @@ use ratatui::layout::{Position, Rect};
 use ratatui::widgets::TableState;
 
 use crate::anex::Record;
-use crate::howdy::{self, Section, Term};
-use crate::model::{self, ProfRow, RmpState, Sort};
+use crate::model::{self, ProfRow, RmpState, Roster, Sort};
+use crate::names::Person;
 use crate::rmp::Found;
-use crate::worker::{Job, Msg};
+use crate::schedule::{self, Section, Term};
+use crate::worker::{Job, Msg, Source};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
     EditCourse,
     PickTerm,
+    EditProfs,
     Help,
 }
 
 pub struct Lookup {
-    pub term: Term,
+    pub source: Source,
     pub subject: String,
     pub number: String,
+    /// Set once the worker reports back.
+    pub loaded: bool,
+    /// Stays `None` for a typed-in roster.
     pub sections: Option<Result<Vec<Section>, String>>,
+    pub other_campus: usize,
     pub anex: Option<Result<Vec<Record>, String>>,
     pub rmp: HashMap<String, RmpState>,
     pub done: bool,
 }
 
 impl Lookup {
+    pub fn term(&self) -> Option<&Term> {
+        match &self.source {
+            Source::Sb(t) => Some(t),
+            Source::Manual(_) => None,
+        }
+    }
+
+    pub fn roster(&self) -> Roster<'_> {
+        Roster::pick(self.source.manual_names(), self.sections())
+    }
+
     pub fn sections(&self) -> &[Section] {
         match &self.sections {
             Some(Ok(s)) => s,
@@ -69,6 +86,12 @@ pub struct App {
     pub picker_filter: String,
     pub picker_sel: usize,
     pub include_honors: bool,
+    /// `Some` with `--noSB`: the professors the user typed in from Schedule
+    /// Builder, used instead of AggieSB+.
+    pub profs: Option<Vec<String>>,
+    pub prof_input: String,
+    pub prof_sel: usize,
+    profs_before_edit: Vec<String>,
     pub sort: Sort,
     generation: u64,
     pub lookup: Option<Lookup>,
@@ -102,6 +125,7 @@ impl App {
         course: Option<String>,
         term_query: Option<String>,
         include_honors: bool,
+        profs: Option<Vec<String>>,
     ) -> App {
         let pending = course.as_deref().and_then(parse_course);
         let mut app = App {
@@ -120,6 +144,10 @@ impl App {
             picker_filter: String::new(),
             picker_sel: 0,
             include_honors,
+            profs,
+            prof_input: String::new(),
+            prof_sel: 0,
+            profs_before_edit: Vec::new(),
             sort: Sort::Gpa,
             generation: 0,
             lookup: None,
@@ -127,7 +155,7 @@ impl App {
             rows: Vec::new(),
             table: TableState::default(),
             selected_key: None,
-            status: "Loading Howdy's term list…".into(),
+            status: String::new(),
             notice: None,
             tick: 0,
             quit: false,
@@ -139,12 +167,28 @@ impl App {
             app.mode = Mode::EditCourse;
         }
         app.cursor = app.input.chars().count();
-        let _ = app.jobs.send(Job::Terms);
+        if app.manual() {
+            // No term list needed: the roster is whatever the user types in.
+            if app.term_query.is_some() {
+                app.notice = Some("--term is ignored with --noSB".into());
+            }
+            if let Some((s, n)) = app.pending.take() {
+                app.start_lookup(s, n, false);
+            }
+        } else {
+            app.status = "Loading the term list from AggieSB+…".into();
+            let _ = app.jobs.send(Job::Terms);
+        }
         app
     }
 
+    /// True with `--noSB`.
+    pub fn manual(&self) -> bool {
+        self.profs.is_some()
+    }
+
     pub fn busy(&self) -> bool {
-        self.term.is_none() || self.lookup.as_ref().is_some_and(|l| !l.done)
+        (!self.manual() && self.term.is_none()) || self.lookup.as_ref().is_some_and(|l| !l.done)
     }
 
     pub fn on_msg(&mut self, msg: Msg) {
@@ -154,18 +198,17 @@ impl App {
             Msg::Course {
                 generation,
                 sections,
+                other_campus,
                 anex,
             } if generation == self.generation => {
                 let Some(l) = &mut self.lookup else { return };
-                let people = model::people(
-                    sections.as_deref().unwrap_or_default(),
-                    anex.as_deref().unwrap_or_default(),
-                );
-                for p in people {
+                l.loaded = true;
+                l.sections = sections;
+                l.other_campus = other_campus;
+                l.anex = Some(anex);
+                for p in model::people(l.roster(), l.records()) {
                     l.rmp.insert(p.key(), RmpState::Pending);
                 }
-                l.sections = Some(sections);
-                l.anex = Some(anex);
                 self.rebuild_rows();
             }
             Msg::Rmp {
@@ -185,16 +228,7 @@ impl App {
             Msg::Done { generation } if generation == self.generation => {
                 if let Some(l) = &mut self.lookup {
                     l.done = true;
-                    let found = l
-                        .rmp
-                        .values()
-                        .filter(|s| matches!(s, RmpState::Found(_)))
-                        .count();
-                    self.status = format!(
-                        "{} professors · {found}/{} found on RMP",
-                        self.rows.len(),
-                        l.rmp.len()
-                    );
+                    self.done_status();
                 }
             }
             _ => {} // stale generation
@@ -208,17 +242,17 @@ impl App {
                 self.terms_live = true;
             }
             other => {
-                self.terms = howdy::guess_terms();
+                self.terms = schedule::guess_terms();
                 let why = other.err().unwrap_or_else(|| "it was empty".into());
                 self.notice = Some(format!(
-                    "Howdy term list unavailable ({why}); offering standard terms"
+                    "AggieSB+ term list unavailable ({why}); offering standard terms"
                 ));
             }
         }
         let wanted = self.term_query.take();
         let resolved = wanted
             .as_deref()
-            .and_then(|q| howdy::resolve_term(q, &self.terms));
+            .and_then(|q| schedule::resolve_term(q, &self.terms));
         if let (Some(q), None) = (&wanted, &resolved) {
             self.notice = Some(format!("No term matches \"{q}\"; press t to choose one"));
         }
@@ -230,36 +264,66 @@ impl App {
     }
 
     fn start_lookup(&mut self, subject: String, number: String, refresh: bool) {
-        let Some(term) = self.term.clone() else {
-            self.pending = Some((subject, number));
-            return;
+        let source = match (&self.profs, &self.term) {
+            (Some(names), _) => Source::Manual(names.clone()),
+            (None, Some(term)) => Source::Sb(term.clone()),
+            (None, None) => {
+                self.pending = Some((subject, number));
+                return;
+            }
         };
+        let same_course = self.current_course() == Some((subject.clone(), number.clone()));
         self.generation += 1;
         self.lookup = Some(Lookup {
-            term: term.clone(),
+            source: source.clone(),
             subject: subject.clone(),
             number: number.clone(),
+            loaded: false,
             sections: None,
+            other_campus: 0,
             anex: None,
             rmp: HashMap::new(),
             done: false,
         });
         self.rows.clear();
-        self.selected_key = None;
-        self.table = TableState::default();
+        if !same_course {
+            self.selected_key = None;
+            self.table = TableState::default();
+        }
         self.status = format!("Looking up {subject} {number}…");
         let _ = self.jobs.send(Job::Lookup {
             generation: self.generation,
-            term,
+            source,
             subject,
             number,
             refresh,
         });
+        if !same_course && self.profs.as_ref().is_some_and(Vec::is_empty) {
+            self.open_prof_editor();
+        }
+    }
+
+    fn open_prof_editor(&mut self) {
+        let Some(profs) = &self.profs else { return };
+        self.profs_before_edit = profs.clone();
+        self.prof_input.clear();
+        self.prof_sel = profs.len().saturating_sub(1);
+        self.mode = Mode::EditProfs;
+    }
+
+    /// Close the editor and redo the lookup if the list changed.
+    fn close_prof_editor(&mut self) {
+        self.mode = Mode::Normal;
+        if self.profs.as_ref() != Some(&self.profs_before_edit)
+            && let Some((s, n)) = self.current_course()
+        {
+            self.start_lookup(s, n, false);
+        }
     }
 
     fn rebuild_rows(&mut self) {
         let Some(l) = &self.lookup else { return };
-        let mut rows = model::build_rows(l.sections(), l.records(), self.include_honors);
+        let mut rows = model::build_rows(l.roster(), l.records(), self.include_honors);
         model::sort_rows(&mut rows, self.sort, &l.rmp);
         let idx = self
             .selected_key
@@ -268,6 +332,24 @@ impl App {
             .or((!rows.is_empty()).then_some(0));
         self.rows = rows;
         self.select(idx);
+        self.done_status();
+    }
+
+    /// Counts only the rows on screen, so hidden honors professors don't inflate it.
+    fn done_status(&mut self) {
+        let Some(l) = self.lookup.as_ref().filter(|l| l.done) else {
+            return;
+        };
+        let states: Vec<&RmpState> = self
+            .rows
+            .iter()
+            .filter_map(|r| l.rmp.get(&r.key()))
+            .collect();
+        let found = states
+            .iter()
+            .filter(|s| matches!(s, RmpState::Found(_)))
+            .count();
+        self.status = format!("{} professors · {found} found on RMP", states.len());
     }
 
     fn select(&mut self, idx: Option<usize>) {
@@ -350,6 +432,7 @@ impl App {
             Mode::Normal => self.normal_key(key),
             Mode::EditCourse => self.edit_key(key),
             Mode::PickTerm => self.picker_key(key),
+            Mode::EditProfs => self.prof_key(key),
             Mode::Help => self.mode = Mode::Normal,
         }
     }
@@ -365,6 +448,15 @@ impl App {
                     .map(|(s, n)| format!("{s} {n}"))
                     .unwrap_or_default();
                 self.cursor = self.input.chars().count();
+            }
+            KeyCode::Char('t') if self.manual() => {
+                self.notice =
+                    Some("Terms don't apply to a typed-in roster; press p to edit it".into())
+            }
+            KeyCode::Char('p') if self.manual() => self.open_prof_editor(),
+            KeyCode::Char('p') => {
+                self.notice =
+                    Some("The roster comes from AggieSB+; start with --noSB to type it in".into())
             }
             KeyCode::Char('t') => {
                 if self.terms.is_empty() {
@@ -415,6 +507,7 @@ impl App {
                 None => self.notice = Some("Enter a course like CSCE 121".into()),
             },
             KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Tab if self.manual() => self.open_prof_editor(),
             KeyCode::Tab => self.normal_key(KeyEvent::from(KeyCode::Char('t'))),
             KeyCode::Backspace if self.cursor > 0 => {
                 self.cursor -= 1;
@@ -477,6 +570,56 @@ impl App {
         }
     }
 
+    fn prof_key(&mut self, key: KeyEvent) {
+        let Some(profs) = &mut self.profs else { return };
+        match key.code {
+            // Enter on a blank line finishes; so does Esc (typed names are kept).
+            KeyCode::Esc => self.close_prof_editor(),
+            KeyCode::Enter if self.prof_input.trim().is_empty() => self.close_prof_editor(),
+            KeyCode::Enter => {
+                // ';' separates several names; ',' is reserved for "Last, First".
+                let mut rejected = Vec::new();
+                for name in self
+                    .prof_input
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                {
+                    match Person::from_full(name) {
+                        Some(p)
+                            if profs.iter().any(|q| {
+                                Person::from_full(q).is_some_and(|q| q.key() == p.key())
+                            }) => {}
+                        Some(_) => profs.push(name.to_string()),
+                        None => rejected.push(name.to_string()),
+                    }
+                }
+                self.prof_sel = profs.len().saturating_sub(1);
+                if rejected.is_empty() {
+                    self.prof_input.clear();
+                } else {
+                    self.notice = Some(
+                        "Enter a first and last name, e.g. Teresa Leyk or Leyk, Teresa".into(),
+                    );
+                    self.prof_input = rejected.join("; ");
+                }
+            }
+            KeyCode::Backspace if !self.prof_input.is_empty() => {
+                self.prof_input.pop();
+            }
+            KeyCode::Backspace | KeyCode::Delete if !profs.is_empty() => {
+                profs.remove(self.prof_sel.min(profs.len() - 1));
+                self.prof_sel = self.prof_sel.min(profs.len().saturating_sub(1));
+            }
+            KeyCode::Up => self.prof_sel = self.prof_sel.saturating_sub(1),
+            KeyCode::Down => self.prof_sel = (self.prof_sel + 1).min(profs.len().saturating_sub(1)),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.prof_input.push(c)
+            }
+            _ => {}
+        }
+    }
+
     pub fn on_mouse(&mut self, ev: MouseEvent) {
         if self.mode != Mode::Normal {
             return;
@@ -506,9 +649,9 @@ impl App {
     }
 }
 
-/// The upcoming College Station term if Howdy has it, else the newest one before it.
+/// The upcoming College Station term if it's listed, else the newest one before it.
 fn default_term(terms: &[Term]) -> Option<Term> {
-    let likely = howdy::likely_term_code();
+    let likely = schedule::likely_term_code();
     terms
         .iter()
         .find(|t| t.code == likely)

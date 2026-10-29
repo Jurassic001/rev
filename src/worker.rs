@@ -1,8 +1,6 @@
 //! Background thread that does all network work so the UI never blocks.
 //! Results are tagged with the lookup generation; the UI drops stale ones.
 
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
@@ -10,18 +8,37 @@ use std::thread;
 use reqwest::blocking::Client;
 
 use crate::anex::{self, Record};
-use crate::howdy::{self, Section, Term};
-use crate::model;
+use crate::model::{self, Roster};
 use crate::rmp::{self, Found};
+use crate::sb;
+use crate::schedule::{Section, Term};
 
 /// Parallel RMP requests; enough to be quick without being rude.
 const RMP_THREADS: usize = 4;
+
+/// Where a lookup's professor list comes from.
+#[derive(Clone, Debug)]
+pub enum Source {
+    /// AggieSB+'s copy of the term's class schedule.
+    Sb(Term),
+    /// Names the user typed in from Schedule Builder (`--noSB`).
+    Manual(Vec<String>),
+}
+
+impl Source {
+    pub fn manual_names(&self) -> Option<&[String]> {
+        match self {
+            Source::Manual(names) => Some(names),
+            Source::Sb(_) => None,
+        }
+    }
+}
 
 pub enum Job {
     Terms,
     Lookup {
         generation: u64,
-        term: Term,
+        source: Source,
         subject: String,
         number: String,
         refresh: bool,
@@ -36,7 +53,10 @@ pub enum Msg {
     },
     Course {
         generation: u64,
-        sections: Result<Vec<Section>, String>,
+        /// `None` when the roster was typed in.
+        sections: Option<Result<Vec<Section>, String>>,
+        /// Sections on other campuses, dropped from `sections`.
+        other_campus: usize,
         anex: Result<Vec<Record>, String>,
     },
     Rmp {
@@ -64,7 +84,6 @@ fn run(jobs: Receiver<Job>, out: Sender<Msg>) {
             return;
         }
     };
-    let mut terms_cache: HashMap<String, Arc<Vec<Section>>> = HashMap::new();
     while let Ok(first) = jobs.recv() {
         // Collapse a burst of requests into the newest lookup.
         let mut want_terms = false;
@@ -76,91 +95,94 @@ fn run(jobs: Receiver<Job>, out: Sender<Msg>) {
             }
         }
         if want_terms {
-            let terms = howdy::fetch_terms(&client, false).map_err(|e| format!("{e:#}"));
+            let terms = sb::fetch_terms(&client, false).map_err(|e| format!("{e:#}"));
             if out.send(Msg::Terms(terms)).is_err() {
                 return;
             }
         }
         if let Some(Job::Lookup {
             generation,
-            term,
+            source,
             subject,
             number,
             refresh,
         }) = lookup
+            && !do_lookup(
+                &client, &out, generation, &source, &subject, &number, refresh,
+            )
         {
-            let ok = do_lookup(
-                &client,
-                &out,
-                &mut terms_cache,
-                generation,
-                &term,
-                &subject,
-                &number,
-                refresh,
-            );
-            if !ok {
-                return;
-            }
+            return;
         }
     }
 }
 
 /// Returns false once the UI has gone away.
-#[allow(clippy::too_many_arguments)]
 fn do_lookup(
     client: &Client,
     out: &Sender<Msg>,
-    terms_cache: &mut HashMap<String, Arc<Vec<Section>>>,
     generation: u64,
-    term: &Term,
+    source: &Source,
     subject: &str,
     number: &str,
     refresh: bool,
 ) -> bool {
     let status = |text: String| out.send(Msg::Status { generation, text }).is_ok();
-    let cached = (!refresh)
-        .then(|| terms_cache.get(&term.code).cloned())
-        .flatten();
-    if cached.is_none() && !status(format!("Loading the {} class list from Howdy…", term.desc)) {
+    let loading = match source {
+        Source::Sb(term) => format!(
+            "Loading {subject} {number} for {} from AggieSB+…",
+            term.desc
+        ),
+        Source::Manual(_) => format!("Loading anex grades for {subject} {number}…"),
+    };
+    if !status(loading) {
         return false;
     }
 
-    let (howdy, anex) = thread::scope(|s| {
+    let (sections, anex) = thread::scope(|s| {
         let anex = s.spawn(|| anex::fetch(client, subject, number, refresh));
-        let howdy = match cached {
-            Some(all) => Ok(all),
-            None => howdy::fetch_term(client, &term.code, refresh).map(Arc::new),
+        let sections = match source {
+            Source::Sb(term) => Some(sb::fetch_course(
+                client, &term.code, subject, number, refresh,
+            )),
+            Source::Manual(_) => None,
         };
-        (howdy, anex.join().expect("anex thread panicked"))
+        (sections, anex.join().expect("anex thread panicked"))
     });
-    if let Ok(all) = &howdy {
-        terms_cache.insert(term.code.clone(), all.clone());
-    }
-    let sections: Result<Vec<Section>, String> = howdy
-        .map(|all| {
-            all.iter()
-                .filter(|s| s.subject.eq_ignore_ascii_case(subject) && s.course == number)
-                .cloned()
-                .collect()
-        })
-        .map_err(|e| format!("{e:#}"));
+
+    // Other campuses' sections are never shown, so drop them before anything
+    // (RMP lookups included) sees them.
+    let campus = match source {
+        Source::Sb(term) => term.campus(),
+        Source::Manual(_) => None,
+    };
+    let mut other_campus = 0;
+    let sections = sections.map(|result| {
+        result
+            .map(|all| {
+                let (here, away): (Vec<Section>, Vec<Section>) =
+                    all.into_iter().partition(|s| s.on_campus(campus));
+                other_campus = away.len();
+                here
+            })
+            .map_err(|e| format!("{e:#}"))
+    });
     let anex = anex.map_err(|e| format!("{e:#}"));
 
-    let people = model::people(
-        sections.as_deref().unwrap_or_default(),
-        anex.as_deref().unwrap_or_default(),
-    );
-    let dept_hint = sections
-        .as_ref()
-        .ok()
-        .and_then(|s| s.first())
+    let on_campus: &[Section] = match &sections {
+        Some(Ok(s)) => s,
+        _ => &[],
+    };
+    let roster = Roster::pick(source.manual_names(), on_campus);
+    let people = model::people(roster, anex.as_deref().unwrap_or_default());
+    let dept_hint = on_campus
+        .first()
         .map(|s| s.subject_desc.clone())
         .unwrap_or_default();
     if out
         .send(Msg::Course {
             generation,
             sections,
+            other_campus,
             anex,
         })
         .is_err()
@@ -211,7 +233,7 @@ mod live {
     fn anex_and_rmp() {
         let client = crate::net::client().unwrap();
         let records = anex::fetch(&client, "CSCE", "121", true).unwrap();
-        let rows = model::build_rows(&[], &records, false);
+        let rows = model::build_rows(Roster::AnexRecent, &records, false);
         for r in &rows {
             let p = r.person.as_ref().unwrap();
             let found = rmp::lookup(&client, p, "Computer Science & Engineering", true).unwrap();
@@ -223,11 +245,8 @@ mod live {
                 found.map(|f| (
                     f.teacher.first,
                     f.teacher.last,
-                    f.teacher.quality,
-                    f.teacher.difficulty,
                     f.teacher.num_ratings,
-                    f.strength,
-                    f.teacher.legacy_id
+                    f.strength
                 ))
             );
         }
@@ -244,15 +263,37 @@ mod live {
 
     #[test]
     #[ignore]
-    fn howdy() {
+    fn aggie_sb() {
         let client = crate::net::client().unwrap();
-        match howdy::fetch_terms(&client, true) {
-            Ok(t) => println!(
-                "{} terms, newest: {:?}",
-                t.len(),
-                t.iter().take(5).collect::<Vec<_>>()
-            ),
-            Err(e) => println!("terms failed: {e:#}"),
+        let terms = sb::fetch_terms(&client, true).unwrap();
+        println!(
+            "terms: {:?}",
+            terms.iter().map(|t| &t.desc).collect::<Vec<_>>()
+        );
+        let term = terms
+            .iter()
+            .find(|t| t.code == "202711")
+            .expect("Spring 2027 listed");
+        let sections = sb::fetch_course(&client, &term.code, "CSCE", "221", true).unwrap();
+        for s in &sections {
+            println!(
+                "{} {:<16} on_campus={} honors={} {:?} | {}",
+                s.section,
+                s.campus,
+                s.on_campus(term.campus()),
+                s.honors,
+                s.instructors.iter().map(|i| &i.name).collect::<Vec<_>>(),
+                s.meetings
+            );
         }
+        assert!(
+            sections.iter().any(|s| !s.on_campus(term.campus())),
+            "expected a Galveston section"
+        );
+        assert!(
+            sb::fetch_course(&client, &term.code, "CSCE", "121", true)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

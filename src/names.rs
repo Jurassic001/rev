@@ -45,6 +45,17 @@ pub fn title_case(name: &str) -> String {
         .join(" ")
 }
 
+/// "Leyk, Teresa" -> "Teresa Leyk"; "Robert Lightfoot, Jr." stays as is.
+pub fn natural_order(name: &str) -> String {
+    let name = name.trim();
+    match name.split_once(',') {
+        Some((last, first)) if !tokens(first).iter().all(|t| SUFFIXES.contains(&t.as_str())) => {
+            format!("{} {}", first.trim(), last.trim())
+        }
+        _ => name.to_string(),
+    }
+}
+
 /// An instructor as one source knows them.
 #[derive(Clone, Debug)]
 pub enum Person {
@@ -56,12 +67,7 @@ pub enum Person {
 
 impl Person {
     pub fn from_full(name: &str) -> Option<Person> {
-        // Howdy sometimes uses "Last, First"
-        let name = match name.split_once(',') {
-            Some((last, first)) => format!("{first} {last}"),
-            None => name.to_string(),
-        };
-        let t = strip_suffixes(tokens(&name));
+        let t = strip_suffixes(tokens(&natural_order(name)));
         (t.len() >= 2).then_some(Person::Full(t))
     }
 
@@ -287,6 +293,24 @@ mod tests {
         let p = Person::from_anex("LUPOLI S").unwrap();
         assert_eq!(rmp_match(&p, "Shawn", "Lupoli"), Some(Strength::Initial));
         assert_eq!(p.display(), "S. Lupoli");
+    }
+
+    #[test]
+    fn name_order() {
+        assert_eq!(natural_order(" Leyk, Teresa "), "Teresa Leyk");
+        assert_eq!(
+            natural_order("Robert Lightfoot, Jr."),
+            "Robert Lightfoot, Jr."
+        );
+        assert_eq!(
+            Person::from_full("Lightfoot, Robert").unwrap().key(),
+            "ROBERT LIGHTFOOT"
+        );
+        assert_eq!(
+            Person::from_full("Robert Lightfoot, Jr.").unwrap().key(),
+            "ROBERT LIGHTFOOT"
+        );
+        assert!(Person::from_full("Leyk").is_none());
     }
 
     #[test]

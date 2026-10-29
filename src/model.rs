@@ -4,9 +4,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::anex::{Grades, Record};
-use crate::howdy::Section;
 use crate::names::{self, Person};
 use crate::rmp::Found;
+use crate::schedule::Section;
 
 /// How many of anex's most recent terms count as "currently teaching" when
 /// we have to fall back to anex for the roster.
@@ -100,6 +100,27 @@ fn aggregate<'a>(records: impl Iterator<Item = &'a Record>) -> (Grades, Vec<Term
     (total, by_term.into_values().rev().collect())
 }
 
+/// Who's teaching, as far as we know.
+#[derive(Clone, Copy)]
+pub enum Roster<'a> {
+    /// This term's sections, already limited to the term's campus.
+    Sections(&'a [Section]),
+    /// Names the user typed in from Schedule Builder (`--noSB`).
+    Names(&'a [String]),
+    /// Nothing to go on: whoever anex shows teaching it recently.
+    AnexRecent,
+}
+
+impl<'a> Roster<'a> {
+    pub fn pick(manual: Option<&'a [String]>, sections: &'a [Section]) -> Roster<'a> {
+        match manual {
+            Some(names) => Roster::Names(names),
+            None if !sections.is_empty() => Roster::Sections(sections),
+            None => Roster::AnexRecent,
+        }
+    }
+}
+
 /// Distinct instructors across `sections`, in first-seen order.
 fn instructors<'a>(sections: impl Iterator<Item = &'a Section>) -> Vec<(String, Person)> {
     let mut out: Vec<(String, Person)> = Vec::new();
@@ -110,6 +131,19 @@ fn instructors<'a>(sections: impl Iterator<Item = &'a Section>) -> Vec<(String, 
             {
                 out.push((i.name.clone(), p));
             }
+        }
+    }
+    out
+}
+
+/// Typed-in names, deduplicated; entries without a first and last name are dropped.
+fn typed_names(names: &[String]) -> Vec<(String, Person)> {
+    let mut out: Vec<(String, Person)> = Vec::new();
+    for n in names {
+        if let Some(p) = Person::from_full(n)
+            && !out.iter().any(|(_, q)| q.key() == p.key())
+        {
+            out.push((names::natural_order(n), p));
         }
     }
     out
@@ -138,83 +172,115 @@ fn recent_anex_profs<'a>(records: impl Iterator<Item = &'a Record> + Clone) -> V
 
 /// Everyone the worker should look up on RMP. Honors sections are included so
 /// toggling them on later needs no new requests.
-pub fn people(sections: &[Section], records: &[Record]) -> Vec<Person> {
-    if sections.is_empty() {
-        recent_anex_profs(records.iter())
-            .iter()
-            .filter_map(|p| Person::from_anex(p))
-            .collect()
-    } else {
-        instructors(sections.iter())
+pub fn people(roster: Roster, records: &[Record]) -> Vec<Person> {
+    match roster {
+        Roster::Sections(sections) => instructors(sections.iter())
             .into_iter()
             .map(|(_, p)| p)
-            .collect()
+            .collect(),
+        Roster::Names(names) => typed_names(names).into_iter().map(|(_, p)| p).collect(),
+        Roster::AnexRecent => recent_anex_profs(records.iter())
+            .iter()
+            .filter_map(|p| Person::from_anex(p))
+            .collect(),
     }
 }
 
-/// One row per professor. With Howdy sections the roster is this term's; with
-/// none it is anex's recent instructors.
-pub fn build_rows(sections: &[Section], records: &[Record], include_honors: bool) -> Vec<ProfRow> {
-    let records: Vec<&Record> = records
-        .iter()
-        .filter(|r| include_honors || !r.honors())
-        .collect();
-    if sections.is_empty() {
-        return recent_anex_profs(records.iter().copied())
-            .into_iter()
-            .filter_map(|prof| {
-                let person = Person::from_anex(&prof)?;
-                let (grades, history) =
-                    aggregate(records.iter().copied().filter(|r| r.prof == prof));
-                Some(ProfRow {
-                    name: person.display(),
-                    person: Some(person),
-                    sections: Vec::new(),
-                    grades,
-                    history,
-                })
-            })
+/// anex records for one course, ready to be matched against full names.
+struct AnexIndex<'a> {
+    records: Vec<&'a Record>,
+    spellings: Vec<(&'a str, Person)>,
+}
+
+impl<'a> AnexIndex<'a> {
+    fn new(records: &'a [Record], include_honors: bool) -> AnexIndex<'a> {
+        let records: Vec<&Record> = records
+            .iter()
+            .filter(|r| include_honors || !r.honors())
             .collect();
+        let mut names: Vec<&str> = records.iter().map(|r| r.prof.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        let spellings = names
+            .into_iter()
+            .filter_map(|n| Some((n, Person::from_anex(n)?)))
+            .collect();
+        AnexIndex { records, spellings }
     }
+
+    fn grades_for(&self, person: &Person) -> (Grades, Vec<TermGrades>) {
+        let Person::Full(full) = person else {
+            return Default::default();
+        };
+        let matches: Vec<_> = self
+            .spellings
+            .iter()
+            .filter_map(|(n, p)| Some((names::anex_match(full, p)?, *n)))
+            .collect();
+        // Only keep the most confident spelling(s), so "MOORE J" doesn't
+        // pull in a middle-initial match when an exact one exists.
+        let best = matches.iter().map(|(s, _)| *s).max();
+        let spellings: Vec<&str> = matches
+            .iter()
+            .filter(|(s, _)| Some(*s) == best)
+            .map(|(_, n)| *n)
+            .collect();
+        aggregate(
+            self.records
+                .iter()
+                .copied()
+                .filter(|r| spellings.contains(&r.prof.as_str())),
+        )
+    }
+}
+
+/// One row per professor on the roster.
+pub fn build_rows(roster: Roster, records: &[Record], include_honors: bool) -> Vec<ProfRow> {
+    let anex = AnexIndex::new(records, include_honors);
+    let sections = match roster {
+        Roster::Sections(sections) => sections,
+        Roster::Names(names) => {
+            return typed_names(names)
+                .into_iter()
+                .map(|(name, person)| {
+                    let (grades, history) = anex.grades_for(&person);
+                    ProfRow {
+                        name,
+                        person: Some(person),
+                        sections: Vec::new(),
+                        grades,
+                        history,
+                    }
+                })
+                .collect();
+        }
+        Roster::AnexRecent => {
+            return recent_anex_profs(anex.records.iter().copied())
+                .into_iter()
+                .filter_map(|prof| {
+                    let person = Person::from_anex(&prof)?;
+                    let (grades, history) =
+                        aggregate(anex.records.iter().copied().filter(|r| r.prof == prof));
+                    Some(ProfRow {
+                        name: person.display(),
+                        person: Some(person),
+                        sections: Vec::new(),
+                        grades,
+                        history,
+                    })
+                })
+                .collect();
+        }
+    };
 
     let sections: Vec<&Section> = sections
         .iter()
         .filter(|s| include_honors || !s.honors)
         .collect();
-    let anex_people: Vec<(&str, Person)> = {
-        let mut names: Vec<&str> = records.iter().map(|r| r.prof.as_str()).collect();
-        names.sort_unstable();
-        names.dedup();
-        names
-            .into_iter()
-            .filter_map(|n| Some((n, Person::from_anex(n)?)))
-            .collect()
-    };
-
     let mut rows: Vec<ProfRow> = instructors(sections.iter().copied())
         .into_iter()
         .map(|(name, person)| {
-            let Person::Full(full) = &person else {
-                unreachable!()
-            };
-            let matches: Vec<_> = anex_people
-                .iter()
-                .filter_map(|(n, p)| Some((names::anex_match(full, p)?, *n)))
-                .collect();
-            // Only keep the most confident spelling(s), so "MOORE J" doesn't
-            // pull in a middle-initial match when an exact one exists.
-            let best = matches.iter().map(|(s, _)| *s).max();
-            let spellings: Vec<&str> = matches
-                .iter()
-                .filter(|(s, _)| Some(*s) == best)
-                .map(|(_, n)| *n)
-                .collect();
-            let (grades, history) = aggregate(
-                records
-                    .iter()
-                    .copied()
-                    .filter(|r| spellings.contains(&r.prof.as_str())),
-            );
+            let (grades, history) = anex.grades_for(&person);
             let mine = sections
                 .iter()
                 .filter(|s| {
@@ -296,7 +362,7 @@ pub fn sort_rows(rows: &mut [ProfRow], sort: Sort, rmp: &HashMap<String, RmpStat
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::howdy::Instructor;
+    use crate::schedule::Instructor;
 
     fn record(prof: &str, section: &str, year: u16, sem: &str, a: u32, f: u32) -> Record {
         Record {
@@ -314,13 +380,12 @@ mod tests {
 
     fn section(num: &str, who: &[&str]) -> Section {
         Section {
-            subject: "CSCE".into(),
-            course: "121".into(),
             section: num.into(),
             crn: "1".into(),
             title: String::new(),
             subject_desc: String::new(),
-            schedule: String::new(),
+            campus: "College Station".into(),
+            delivery: String::new(),
             meetings: String::new(),
             open: None,
             honors: crate::anex::is_honors_section(num),
@@ -335,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn joins_howdy_and_anex() {
+    fn joins_sections_and_anex() {
         let records = vec![
             record("LUPOLI S", "501", 2023, "FALL", 10, 0),
             record("LUPOLI S", "200", 2023, "FALL", 10, 0),
@@ -347,14 +412,14 @@ mod tests {
             section("201", &["Honors Only"]),
             section("502", &[]),
         ];
-        let rows = build_rows(&sections, &records, false);
+        let rows = build_rows(Roster::Sections(&sections), &records, false);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].name, "Shawn Lupoli");
         assert_eq!(rows[0].grades.a, 15); // honors section 200 excluded
         assert_eq!(rows[0].history[0].label, "Spring 2024");
         assert!(rows[1].person.is_none());
 
-        let with_honors = build_rows(&sections, &records, true);
+        let with_honors = build_rows(Roster::Sections(&sections), &records, true);
         assert_eq!(with_honors.len(), 3);
         assert_eq!(with_honors[0].grades.a, 25);
     }
@@ -368,9 +433,29 @@ mod tests {
             record("C C", "501", 2024, "SPRING", 1, 0),
             record("D D", "501", 2024, "SUMMER", 1, 0),
         ];
-        let rows = build_rows(&[], &records, false);
+        let rows = build_rows(Roster::AnexRecent, &records, false);
         let names: Vec<_> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, ["A. A", "B. B", "C. C", "D. D"]);
-        assert_eq!(people(&[], &records).len(), 4);
+        assert_eq!(people(Roster::AnexRecent, &records).len(), 4);
+    }
+
+    #[test]
+    fn typed_in_names() {
+        let records = vec![
+            record("LEYK T", "501", 2024, "SPRING", 10, 2),
+            record("LEYK T", "200", 2024, "SPRING", 9, 0),
+            record("PEARCE R", "502", 2023, "FALL", 3, 3),
+        ];
+        let names: Vec<String> = ["Leyk, Teresa", "Roger A. Pearce", "Teresa Leyk", "Merchant"]
+            .map(String::from)
+            .to_vec();
+        let roster = Roster::pick(Some(&names), &[]);
+        let rows = build_rows(roster, &records, false);
+        let shown: Vec<_> = rows.iter().map(|r| r.name.as_str()).collect();
+        // duplicate Leyk collapsed, last-name-only entry dropped
+        assert_eq!(shown, ["Teresa Leyk", "Roger A. Pearce"]);
+        assert_eq!(rows[0].grades.a, 10);
+        assert_eq!(rows[1].grades.f, 3);
+        assert_eq!(people(roster, &records).len(), 2);
     }
 }
